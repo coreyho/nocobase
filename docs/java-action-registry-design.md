@@ -488,3 +488,169 @@ public interface UnifiedActionInvoker {
 - 用统一 metadata schema 和统一调用 envelope 解决跨服务、跨语言一致性；
 - 通过版本、状态、审计和可观测能力，保证该机制在生产可用。
 
+---
+
+## 15. 面向大模型的能力暴露（参考 Claude Skills 定义）
+
+为方便大模型“发现并正确调用 Action”，建议在 Registry 之上增加一个 **LLM Skill Adapter**，将 ActionMetadata 映射为模型可消费的 Skill 定义（类似 Claude Skills 的 `name + description + usage instructions`）。
+
+### 15.1 目标
+
+- 让模型先做“能力发现”，再做“参数补齐与调用”；
+- 降低模型直接理解底层 RPC/HTTP 细节的成本；
+- 将 Action 的治理能力（版本、权限、租户、限流）透出给模型编排层。
+
+### 15.2 Skill 视图（由 Action 自动生成）
+
+建议新增只读接口：
+
+- `GET /api/llm/skills`
+- `GET /api/llm/skills/{skillName}`
+
+返回结构建议（示例）：
+
+```json
+{
+  "name": "crm-customer-create",
+  "description": "Create a CRM customer record. Use when user asks to add a new customer.",
+  "input_schema": {
+    "type": "object",
+    "required": ["customerName"],
+    "properties": {
+      "customerName": { "type": "string" },
+      "phone": { "type": "string" },
+      "source": { "type": "string" }
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "customerId": { "type": "string" }
+    }
+  },
+  "invoke": {
+    "method": "POST",
+    "path": "/api/action-invoke/crm.customer.create",
+    "version": "1.0.0"
+  },
+  "policy": {
+    "auth": "JWT",
+    "idempotent": true,
+    "timeoutMs": 3000
+  }
+}
+```
+
+### 15.3 ActionMetadata 到 Skill 的映射规则
+
+- `metadata.namespace + metadata.name` -> `skill.name`（建议转 kebab-case）；
+- `metadata.description` + 业务标签 -> `skill.description`；
+- `spec.inputSchema` -> `skill.input_schema`；
+- `spec.outputSchema` -> `skill.output_schema`；
+- `spec.endpoint + version` -> `skill.invoke`；
+- `spec.auth / idempotency / timeoutMs` -> `skill.policy`。
+
+### 15.4 给模型的调用约束（标准化提示片段）
+
+建议在 Skill 详情中附带 `usage_guidelines`，用于约束模型行为：
+
+1. 仅调用 `state=ACTIVE` 的 action；
+2. 调用前必须按 `input_schema` 做参数校验；
+3. 缺少必填参数时，先追问用户，不得猜测；
+4. 幂等 action 必须传 `Idempotency-Key`；
+5. 失败时按统一错误码决定是否重试（仅 `retryable=true` 可重试）。
+
+### 15.5 多模型兼容建议
+
+- 对外暴露统一 Skill DTO，不绑定单一模型厂商；
+- 通过 Adapter 层输出不同协议：
+  - `Claude Skill` 风格（name/description/input schema/usage）；
+  - `OpenAI Tool` 风格（function name + JSON schema）；
+  - `MCP Tool` 风格（tool list + invoke）。
+
+这样 Action 一次注册，可被不同大模型以各自“工具/技能”协议消费。
+
+---
+
+## 16. 如何支持热部署（Hot Deployment）
+
+为保证 Action 在不停机条件下上线、下线与升级，建议引入“**控制面版本切换 + 数据面无状态执行器热更新**”机制。
+
+### 16.1 热部署目标
+
+- 新 Action 可在不重启业务服务的情况下生效；
+- Action 新版本可灰度发布并快速回滚；
+- 不中断已有调用（in-flight 请求可完成）；
+- 对模型侧 Skill 目录可实时刷新。
+
+### 16.2 热部署分层策略
+
+1. **元数据热更新（必选）**
+   - Registry 中 Action metadata 变更后，通过事件（SSE/WebSocket/MQ）推送到各服务 SDK；
+   - SDK 的 `ActionCatalog` 增量刷新本地缓存并更新路由表；
+   - 适用于 endpoint、策略、状态（ACTIVE/DISABLED）切换。
+
+2. **执行器热装载（推荐）**
+   - Java 服务内将 Action Handler 以“可替换 Bean/插件 ClassLoader”方式加载；
+   - 新版本加载成功后原子替换路由；
+   - 老版本进入 drain 状态，等待在途请求结束后卸载。
+
+3. **进程级无损切换（兜底）**
+   - 如执行器无法安全热替换，则采用滚动发布 + 版本路由；
+   - 通过 Service Mesh/Gateway 做流量切换，逻辑上保持“热部署体验”。
+
+### 16.3 SDK 侧关键机制
+
+- `ActionCatalog.watch()`：订阅 Registry 变更事件；
+- `ActionDispatcher.swap(actionKey, handlerRef)`：原子切换处理器引用；
+- `ActionDispatcher.drain(oldVersion)`：旧版本停止接新流量，仅处理在途请求；
+- `ActionHealthProbe`：新版本加载后先健康检查再接流量。
+
+建议新增本地状态：
+- `WARMING`：新版本加载中；
+- `ACTIVE`：可接收流量；
+- `DRAINING`：仅处理在途请求；
+- `INACTIVE`：已卸载。
+
+### 16.4 标准热部署流程
+
+1. 发布新版本 metadata（`DRAFT`）；
+2. 在目标服务节点预热加载新 handler（`WARMING`）；
+3. 健康检查通过后，切换到 `ACTIVE`；
+4. 按灰度策略（1% -> 10% -> 50% -> 100%）提升流量；
+5. 旧版本进入 `DRAINING`，等待超时窗口（如 30s/60s）；
+6. 完成后标记旧版本 `DEPRECATED` 或 `DISABLED`。
+
+### 16.5 统一调用协议扩展（建议）
+
+为支持灰度/回滚，调用接口增加可选头：
+
+- `X-Action-Version`: 显式版本；
+- `X-Action-Canary`: 灰度标签（如 `beta`, `tenantA`）；
+- `X-Action-Drain-Timeout`: 调用方可接受的切换等待上限。
+
+返回 `meta` 增加：
+- `resolvedVersion`: 实际命中版本；
+- `deploymentState`: `ACTIVE`/`DRAINING`；
+- `routePolicy`: `latest-active`/`canary`/`pinned`。
+
+### 16.6 与 LLM Skill Adapter 的联动
+
+- Skill 查询接口默认仅返回 `ACTIVE` 版本；
+- 若模型或编排层指定 `X-Action-Canary`，可返回对应灰度版本；
+- Skill 缓存需设置短 TTL（如 10~30s）或基于事件实时失效；
+- 当 Action 进入 `DRAINING`，Skill 侧应标记“即将下线”，避免模型继续推荐旧能力。
+
+### 16.7 风险与防护
+
+- **类加载泄漏**：使用独立 ClassLoader 并在卸载后释放引用；
+- **并发切换竞态**：通过 CAS/读写锁保证 handler 原子替换；
+- **长事务调用**：设置最大执行时长，超时后强制失败并告警；
+- **回滚失败**：保留上一个稳定版本快照，支持一键回切。
+
+### 16.8 最小落地建议
+
+- 第一阶段先做“元数据热更新 + 路由热切换”（不做 class 热替换）；
+- 第二阶段增加“执行器热装载 + drain 机制”；
+- 第三阶段接入 Mesh/Gateway 灰度与全链路回滚编排。
+
