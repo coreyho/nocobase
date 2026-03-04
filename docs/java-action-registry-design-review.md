@@ -2,6 +2,17 @@
 
 > 评估说明：当前仓库中未检索到 `design/java-action-registry` 分支或 `design-docs/` 目录内容，故本次先基于现有设计文档 `docs/java-action-registry-design.md` 进行结构化评估，供你对“其他人设计”做评审时直接复用评估框架。
 
+## 0. 评估输入与检索结果
+
+本次按你的要求优先评估 `design-docs` 路径下“其他人设计”。
+
+检索结果：当前仓库快照中未发现 `design-docs/` 目录，也不存在 `design/java-action-registry` 分支内容。为避免阻塞，本报告改为评估当前可见设计文档，并输出可复用评审框架。
+
+已执行的检索（摘要）：
+- `find . -type d -name 'design-docs' -o -path './design-docs'` -> 无结果
+- `find . -maxdepth 4 -type d | rg 'design|action-registry|java-action'` -> 未发现目标路径
+- `git log --all --name-only --pretty=format: | rg 'design-docs|java-action-registry'` -> 仅发现当前两份文档
+
 ## 1. 总体结论
 
 该设计已经覆盖了从 **元数据规范**、**注册/查询/调用接口**、**Java SDK 抽象** 到 **LLM Skill 适配**、**热部署** 的完整链路，文档完整性较高，作为架构蓝图可落地。当前主要短板不在“有没有设计”，而在“可执行细节深度与边界条件”：
